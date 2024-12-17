@@ -23,7 +23,7 @@ spec:
       serviceAccountName: {{ include "desec-webhook.fullname" . }}
       containers:
         - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --tls-cert-file=/tls/tls.crt
@@ -49,21 +49,17 @@ spec:
             - name: certs
               mountPath: /tls
               readOnly: true
-          resources:
-{{ toYaml .Values.resources | indent 12 }}
+          resources: {{- toYaml .Values.resources | nindent 12 }}
       volumes:
         - name: certs
           secret:
             secretName: {{ include "desec-webhook.servingCertificate" . }}
     {{- with .Values.nodeSelector }}
-      nodeSelector:
-{{ toYaml . | indent 8 }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
     {{- end }}
     {{- with .Values.affinity }}
-      affinity:
-{{ toYaml . | indent 8 }}
+      affinity: {{- toYaml . | nindent 8 }}
     {{- end }}
     {{- with .Values.tolerations }}
-      tolerations:
-{{ toYaml . | indent 8 }}
+      tolerations: {{- toYaml . | nindent 8 }}
     {{- end }}

@@ -5,8 +5,8 @@ certManager:
   serviceAccountName: cert-manager
 
 image:
-  repository: "su541/cert-manager-desec-webhook"
-  tag: latest
+  repository: ghcr.io/luzifer/cert-manager-desec-webhook
+  tag: ''
   pullPolicy: IfNotPresent
 
 secretName:
