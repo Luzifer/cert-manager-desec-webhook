@@ -4,127 +4,161 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
-	v1 "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
-	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
-	"github.com/nrdcg/desec"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/klog/v2"
 	"os"
 	"strings"
 
+	"github.com/nrdcg/desec"
+
 	extapi "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 
 	"github.com/cert-manager/cert-manager/pkg/acme/webhook/apis/acme/v1alpha1"
+	"github.com/cert-manager/cert-manager/pkg/acme/webhook/cmd"
+	v1 "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
+	"github.com/cert-manager/cert-manager/pkg/issuer/acme/dns/util"
 )
 
-var GroupName = os.Getenv("GROUP_NAME")
+const desecTTL = 3600 // Minimum defined by DeSEC
 
-func main() {
-	if GroupName == "" {
-		panic("GROUP_NAME must be specified")
-	}
-	cmd.RunWebhookServer(GroupName,
-		&desecDNSProviderSolver{},
-	)
-}
+// https://github.com/kubernetes/community/blob/31a7798d2ec54093364c47d6819e7bc353b57f70/contributors/devel/sig-instrumentation/logging.md
+const (
+	logLevelError    = 0
+	logLevelWarn     = 1
+	logLevelStandard = 2
+	logLevelExtended = 3
+	logLevelDebug    = 4
+	logLevelTrace    = 5
+)
 
-type desecDNSProviderSolver struct {
-	client *kubernetes.Clientset
-}
-
-type desecDNSProviderConfig struct {
-	APIKeySecretRef v1.SecretKeySelector `json:"apiKeySecretRef"`
-}
-
-func (c *desecDNSProviderSolver) Name() string {
-	return "desec"
-}
-
-func (c *desecDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
-	klog.V(1).Infof("preset record '%s'", ch.ResolvedFQDN)
-	cfg, err := loadConfig(ch.Config)
-
-	klog.V(5).Info("retrieving secret")
-	apiToken, err := c.getSecretKey(cfg.APIKeySecretRef, ch.ResourceNamespace)
-	klog.V(5).Info("creating desec client")
-	api := c.getClient(apiToken)
-
-	klog.V(1).Infof("retrieving domain %s", util.UnFqdn(ch.ResolvedZone))
-
-	domain, subName, err := c.getRecordInfo(api, ch)
-	if err != nil {
-		return err
+type (
+	desecDNSProviderSolver struct {
+		client *kubernetes.Clientset
 	}
 
-	recordSet := new(desec.RRSet)
-	recordSet.Domain = domain.Name
-	recordSet.SubName = subName
-	recordSet.Records = append(recordSet.Records, "\""+ch.Key+"\"")
-	recordSet.Type = "TXT"
-	recordSet.TTL = 3600
-
-	klog.V(5).Info(recordSet)
-
-	record, err := api.Records.Create(context.Background(), *recordSet)
-	if err != nil {
-		klog.Fatal(err)
-		return err
+	desecDNSProviderConfig struct {
+		APIKeySecretRef v1.SecretKeySelector `json:"apiKeySecretRef"`
 	}
+)
 
-	klog.V(5).Infof("Record %s", record)
-	return nil
-}
+var groupName = os.Getenv("GROUP_NAME")
 
-func (c *desecDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
-	klog.V(1).Infof("cleanup record '%s'", ch.ResolvedFQDN)
-	cfg, err := loadConfig(ch.Config)
-
-	apiToken, err := c.getSecretKey(cfg.APIKeySecretRef, ch.ResourceNamespace)
-	api := c.getClient(apiToken)
-
-	domain, subName, err := c.getRecordInfo(api, ch)
-	if err != nil {
-		return err
-	}
-
-	recError := api.Records.Delete(context.Background(), domain.Name, subName, "TXT")
-	if recError != nil {
-		return recError
-	}
-	klog.V(1).Infof("Record %s in zone %s deleted", subName, domain.Name)
-	return nil
-}
-
-func (c *desecDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
-	cl, err := kubernetes.NewForConfig(kubeClientConfig)
-	if err != nil {
-		return err
-	}
-
-	c.client = cl
-	return nil
-}
-
-func loadConfig(cfgJSON *extapi.JSON) (desecDNSProviderConfig, error) {
-	cfg := desecDNSProviderConfig{}
+func loadConfig(cfgJSON *extapi.JSON) (cfg desecDNSProviderConfig, err error) {
 	// handle the 'base case' where no configuration has been provided
 	if cfgJSON == nil {
 		return cfg, nil
 	}
-	if err := json.Unmarshal(cfgJSON.Raw, &cfg); err != nil {
-		return cfg, fmt.Errorf("error decoding solver config: %v", err)
+
+	if err = json.Unmarshal(cfgJSON.Raw, &cfg); err != nil {
+		return cfg, fmt.Errorf("decoding solver config: %w", err)
 	}
 
 	return cfg, nil
 }
 
-func (c *desecDNSProviderSolver) getDomain(client desec.Client, subname string) (*desec.Domain, error) {
+func main() {
+	if groupName == "" {
+		panic("GROUP_NAME must be specified")
+	}
+
+	cmd.RunWebhookServer(groupName, &desecDNSProviderSolver{})
+}
+
+// CleanUp is responsible for deleting the challenge record after the
+// ACME challenge is completed
+func (c *desecDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
+	klog.V(logLevelStandard).Infof("cleanup record %q", ch.ResolvedFQDN)
+
+	klog.V(logLevelTrace).Info("creating desec client")
+	api, err := c.getAuthorizedClient(ch)
+	if err != nil {
+		return fmt.Errorf("getting desec client: %w", err)
+	}
+
+	domain, subName, err := c.getRecordInfo(api, ch)
+	if err != nil {
+		return fmt.Errorf("getting record info: %w", err)
+	}
+
+	if err = api.Records.Delete(context.Background(), domain.Name, subName, "TXT"); err != nil {
+		return fmt.Errorf("deleting record: %w", err)
+	}
+
+	klog.V(1).Infof("record %s in zone %s deleted", subName, domain.Name)
+	return nil
+}
+
+// Initialize configures the Kubernetes ClientSet for accessing the
+// secret containing the API-Key
+func (c *desecDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, _ <-chan struct{}) (err error) {
+	if c.client, err = kubernetes.NewForConfig(kubeClientConfig); err != nil {
+		return fmt.Errorf("creating kubernetes ClientSet: %w", err)
+	}
+
+	return nil
+}
+
+// Name returns the solver name to be registered in the given group
+func (*desecDNSProviderSolver) Name() string { return "desec" }
+
+// Present is responsible for creating the record requested in the ACME
+// challenge for the given domain
+func (c *desecDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
+	klog.V(logLevelStandard).Infof("preset record %q", ch.ResolvedFQDN)
+
+	klog.V(logLevelTrace).Info("creating desec client")
+	api, err := c.getAuthorizedClient(ch)
+	if err != nil {
+		return fmt.Errorf("getting desec client: %w", err)
+	}
+
+	klog.V(logLevelStandard).Infof("retrieving domain %s", util.UnFqdn(ch.ResolvedZone))
+	domain, subName, err := c.getRecordInfo(api, ch)
+	if err != nil {
+		return err
+	}
+
+	recordSet := desec.RRSet{
+		Domain:  domain.Name,
+		SubName: subName,
+		Type:    "TXT",
+		Records: []string{fmt.Sprintf("%q", ch.Key)},
+		TTL:     desecTTL,
+	}
+
+	klog.V(logLevelTrace).Info(recordSet)
+
+	record, err := api.Records.Create(context.Background(), recordSet)
+	if err != nil {
+		return fmt.Errorf("creating record: %w", err)
+	}
+
+	klog.V(logLevelTrace).Infof("record %#v", record)
+	return nil
+}
+
+func (c *desecDNSProviderSolver) getAuthorizedClient(ch *v1alpha1.ChallengeRequest) (*desec.Client, error) {
+	cfg, err := loadConfig(ch.Config)
+	if err != nil {
+		return nil, fmt.Errorf("loading config: %w", err)
+	}
+
+	klog.V(logLevelTrace).Info("retrieving secret")
+	apiToken, err := c.getSecretKey(cfg.APIKeySecretRef, ch.ResourceNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("retrieving secret: %w", err)
+	}
+
+	klog.V(logLevelTrace).Info("creating desec client")
+	return desec.New(apiToken, desec.NewDefaultClientOptions()), nil
+}
+
+func (*desecDNSProviderSolver) getDomain(client *desec.Client, subname string) (*desec.Domain, error) {
 	domains, err := client.Domains.GetAll(context.Background())
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("getting all domains: %w", err)
 	}
 
 	for _, v := range domains {
@@ -132,18 +166,20 @@ func (c *desecDNSProviderSolver) getDomain(client desec.Client, subname string) 
 			return &v, nil
 		}
 	}
+
 	return nil, fmt.Errorf("domain not found")
 }
 
-func (c *desecDNSProviderSolver) getRecordInfo(api desec.Client, ch *v1alpha1.ChallengeRequest) (*desec.Domain, string, error) {
-	klog.V(5).Infof("%s record", ch.ResolvedFQDN)
+func (c *desecDNSProviderSolver) getRecordInfo(api *desec.Client, ch *v1alpha1.ChallengeRequest) (*desec.Domain, string, error) {
+	klog.V(logLevelTrace).Infof("%s record", ch.ResolvedFQDN)
+
 	// Remove trailing dots from zone and fqdn
 	zone := util.UnFqdn(ch.ResolvedZone)
 	fqdn := util.UnFqdn(ch.ResolvedFQDN)
 
 	domain, err := c.getDomain(api, zone)
 	if err != nil {
-		return nil, "", err
+		return nil, "", fmt.Errorf("getting domain: %w", err)
 	}
 
 	// Get the subdomain portion of fqdn
@@ -152,22 +188,18 @@ func (c *desecDNSProviderSolver) getRecordInfo(api desec.Client, ch *v1alpha1.Ch
 	return domain, subName, nil
 }
 
-func (c *desecDNSProviderSolver) getClient(apiToken string) desec.Client {
-	return *desec.New(apiToken, desec.NewDefaultClientOptions())
-}
-
 // getSecretKey fetch a secret key based on a selector and a namespace
 func (c *desecDNSProviderSolver) getSecretKey(secret v1.SecretKeySelector, namespace string) (string, error) {
-	klog.V(5).Infof("retrieving key `%s` in secret `%s/%s`", secret.Key, namespace, secret.Name)
+	klog.V(logLevelTrace).Infof("retrieving key `%s` in secret `%s/%s`", secret.Key, namespace, secret.Name)
 
 	sec, err := c.client.CoreV1().Secrets(namespace).Get(context.Background(), secret.Name, metav1.GetOptions{})
 	if err != nil {
-		return "", fmt.Errorf("secret `%s/%s` not found", namespace, secret.Name)
+		return "", fmt.Errorf("getting secret: %w", err)
 	}
 
 	data, ok := sec.Data[secret.Key]
 	if !ok {
-		return "", fmt.Errorf("key `%q` not found in secret `%s/%s`", secret.Key, namespace, secret.Name)
+		return "", fmt.Errorf("key %q not found in secret %s/%s", secret.Key, namespace, secret.Name)
 	}
 
 	return string(data), nil
