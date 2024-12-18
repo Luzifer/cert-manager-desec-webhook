@@ -1,0 +1,126 @@
+---
+
+name: Artifact Publishing
+
+on:
+  push:
+    branches: [ master ]
+    # Publish semver tags as releases.
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ master ]
+
+env:
+  # Use docker.io for Docker Hub if empty
+  REGISTRY: ghcr.io
+  # github.repository as <account>/<repo>
+  IMAGE_NAME: ${{ github.repository }}
+
+
+jobs:
+  build:
+    defaults:
+      run:
+        shell: bash
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Generate Docker / Helm version
+        id: version
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY,,}"
+
+          function output() {
+            echo "${1}=${2}" >>${GITHUB_OUTPUT}
+          }
+
+          output docker_image_name "${repo}"
+          output helm_registry "oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts"
+
+          case "${GITHUB_REF_TYPE}" in
+          branch)
+            # Generic build to develop: Workflow has to limit branches to master
+            output docker_build_tags "${repo}:develop"
+
+            # Disable publishing of Helm chart
+            output helm_publish "false"
+            ;;
+          tag)
+            # Build to latest & tag: Older tags are not intended to rebuild
+            output docker_build_tags "${repo}:latest,${repo}:${GITHUB_REF_NAME}"
+
+            # Publish Helm chart
+            output helm_publish "true"
+            output helm_version "${GITHUB_REF_NAME##v}"
+            output helm_app_version "${GITHUB_REF_NAME}"
+            ;;
+          *)
+            echo "ERR: The ref type ${GITHUB_REF_TYPE} is not handled." >&2
+            exit 1
+            ;;
+          esac
+
+      # Set up BuildKit Docker container builder to be able to build
+      # multi-platform images and export cache
+      # https://github.com/docker/setup-buildx-action
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.8.0
+        with:
+          platforms: linux/amd64
+
+      # Login against a Docker registry except on PR
+      # https://github.com/docker/login-action
+      - name: Log into registry ${{ env.REGISTRY }}
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract metadata (tags, labels) for Docker
+      # https://github.com/docker/metadata-action
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5.6.1
+        with:
+          images: ${{ steps.version.outputs.docker_image_name }}
+
+      # Build and push Docker image with Buildx (don't push on PR)
+      # https://github.com/docker/build-push-action
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v6.10.0
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.version.outputs.docker_build_tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+
+      # Install Helm CLI
+      # https://github.com/Azure/setup-helm
+      - name: Install Helm for publishing
+        if: ${{ steps.version.outputs.helm_publish == 'true' }}
+        uses: azure/setup-helm@v4.2.0
+
+      - name: Build and push Helm chart
+        if: ${{ steps.version.outputs.helm_publish == 'true' }}
+        run: |
+          sed -E -i \
+            -e 's/version: .*/version: ${{ steps.version.outputs.helm_version }}/' \
+            -e 's/appVersion: .*/appVersion: ${{ steps.version.outputs.helm_app_version }}/' \
+            charts/cert-manager-desec-webhook/Chart.yaml
+
+          helm package charts/cert-manager-desec-webhook
+          helm push cert-manager-desec-webhook-*.tgz ${{ steps.version.outputs.helm_registry }}
+
+...
