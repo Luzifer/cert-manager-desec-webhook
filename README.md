@@ -17,10 +17,19 @@ of the API can be found [here](https://desec.readthedocs.io/en/latest/)
 
 ### Using helm from local checkout
 ```bash
-helm install desec-webhook -n cert-manager deploy
+helm install \
+  -n cert-manager \
+  desec-webhook \
+  charts/cert-manager-desec-webhook
 ```
 ### Using public helm chart
-
+```bash
+helm install \
+  -n cert-manager \
+  --version <release without leading "v"> \
+  desec-webhook \
+  oci://ghcr.io/luzifer/charts/cert-manager-desec-webhook
+```
 
 ## Uninstallation
 
