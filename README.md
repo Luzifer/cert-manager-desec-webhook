@@ -11,7 +11,7 @@ of the API can be found [here](https://desec.readthedocs.io/en/latest/)
 - [go](https://golang.org) => 1.22.0
 - [helm](https://helm.sh/) >= v3.0.0
 - [kuberentes](https://kubernetes.io/) => 1.25.0
-- [cert-manager](https://cert-managaer.io/) => 1.15.1
+- [cert-manager](https://cert-manager.io/) => 1.15.1
 
 ## Installation
 
